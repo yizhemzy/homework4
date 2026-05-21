@@ -1,0 +1,288 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+import os
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from sacrebleu import corpus_bleu
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ================= 数据 =================
+def read(path):
+    with open(path, encoding="utf-8") as f:
+        return [l.strip() for l in f][:2000]
+
+def tok(x): return x.lower().split()
+
+def build_vocab(sents):
+    c = Counter()
+    for s in sents:
+        c.update(tok(s))
+    v = {"<pad>":0,"<sos>":1,"<eos>":2,"<unk>":3}
+    for w,f in c.items():
+        if f>=2:
+            v[w]=len(v)
+    return v
+
+def num(s,v):
+    return torch.tensor([v.get(t,3) for t in ["<sos>"]+tok(s)+["<eos>"]])
+
+class MyData(Dataset):
+    def __init__(self,en,de,sv,tv):
+        self.en = read(en)
+        self.de = read(de)
+        self.sv = sv
+        self.tv = tv
+    def __len__(self): return len(self.en)
+    def __getitem__(self,i):
+        return num(self.en[i],self.sv), num(self.de[i],self.tv)
+
+def collate(b,p):
+    s,t=zip(*b)
+    return pad_sequence(s,True,p), pad_sequence(t,True,p)
+
+def load(batch=16):
+    path=".data/multi30k"
+    train_en=os.path.join(path,"train.en")
+    train_de=os.path.join(path,"train.de")
+    val_en=os.path.join(path,"val.en")
+    val_de=os.path.join(path,"val.de")
+    test_en=os.path.join(path,"test.en")
+    test_de=os.path.join(path,"test.de")
+
+    sv=build_vocab(read(train_en))
+    tv=build_vocab(read(train_de))
+
+    pad=tv["<pad>"]
+
+    train=DataLoader(MyData(train_en,train_de,sv,tv),batch,True,
+                     collate_fn=lambda b:collate(b,pad))
+    val=DataLoader(MyData(val_en,val_de,sv,tv),batch,False,
+                   collate_fn=lambda b:collate(b,pad))
+    test=DataLoader(MyData(test_en,test_de,sv,tv),batch,False,
+                    collate_fn=lambda b:collate(b,pad))
+
+    return train,val,test,sv,tv,pad
+
+
+# ================= Pos Encoding =================
+class PosEnc(nn.Module):
+    def __init__(self,d_model,max_len=100):
+        super().__init__()
+        pe=torch.zeros(max_len,d_model)
+        pos=torch.arange(0,max_len).unsqueeze(1)
+        div=torch.exp(torch.arange(0,d_model,2)*(-math.log(10000.0)/d_model))
+        pe[:,0::2]=torch.sin(pos*div)
+        pe[:,1::2]=torch.cos(pos*div)
+        self.pe=pe.unsqueeze(0)
+
+    def forward(self,x):
+        return x+self.pe[:,:x.size(1)].to(x.device)
+
+
+# ================= Attention =================
+class MHA(nn.Module):
+    def __init__(self,d_model,share_kv):
+        super().__init__()
+        self.dk=d_model//2
+        self.h=2
+        self.share_kv=share_kv
+
+        self.q=nn.Linear(d_model,d_model)
+        self.k=nn.Linear(d_model,d_model)
+        self.v=nn.Linear(d_model,d_model)
+        self.o=nn.Linear(d_model,d_model)
+
+    def forward(self,q,k,v,mask=None):
+        B=q.size(0)
+
+        Q=self.q(q).view(B,-1,self.h,self.dk).transpose(1,2)
+        K=self.k(k).view(B,-1,self.h,self.dk).transpose(1,2)
+        V=K if self.share_kv else self.v(v).view(B,-1,self.h,self.dk).transpose(1,2)
+
+        score=torch.matmul(Q,K.transpose(-2,-1))/math.sqrt(self.dk)
+        if mask is not None:
+            score=score.masked_fill(mask==0,-1e9)
+
+        attn=torch.softmax(score,-1)
+        out=torch.matmul(attn,V)
+
+        out=out.transpose(1,2).contiguous().view(B,-1,self.h*self.dk)
+        return self.o(out)
+
+
+# ================= Encoder =================
+class EncoderLayer(nn.Module):
+    def __init__(self,d,kv,res):
+        super().__init__()
+        self.res=res
+        self.attn=MHA(d,kv)
+        self.ff=nn.Sequential(nn.Linear(d,512),nn.ReLU(),nn.Linear(512,d))
+        self.n1=nn.LayerNorm(d)
+        self.n2=nn.LayerNorm(d)
+
+    def forward(self,x,m):
+        a=self.attn(x,x,x,m)
+        x=self.n1(x+a) if self.res else self.n1(a)
+        f=self.ff(x)
+        x=self.n2(x+f) if self.res else self.n2(f)
+        return x
+
+
+# ================= Decoder =================
+class DecoderLayer(nn.Module):
+    def __init__(self,d,kv,res):
+        super().__init__()
+        self.res=res
+        self.self_attn=MHA(d,kv)
+        self.cross_attn=MHA(d,kv)
+        self.ff=nn.Sequential(nn.Linear(d,512),nn.ReLU(),nn.Linear(512,d))
+        self.n1=nn.LayerNorm(d)
+        self.n2=nn.LayerNorm(d)
+        self.n3=nn.LayerNorm(d)
+
+    def forward(self,x,mem,sm,tm):
+        a=self.self_attn(x,x,x,tm)
+        x=self.n1(x+a) if self.res else self.n1(a)
+
+        a=self.cross_attn(x,mem,mem,sm)
+        x=self.n2(x+a) if self.res else self.n2(a)
+
+        f=self.ff(x)
+        x=self.n3(x+f) if self.res else self.n3(f)
+        return x
+
+
+# ================= Transformer =================
+class Transformer(nn.Module):
+    def __init__(self,sv,tv,res,kv):
+        super().__init__()
+        d=128
+        self.se=nn.Embedding(sv,d)
+        self.te=nn.Embedding(tv,d)
+        self.pos=PosEnc(d)
+
+        self.enc=nn.ModuleList([EncoderLayer(d,kv,res) for _ in range(2)])
+        self.dec=nn.ModuleList([DecoderLayer(d,kv,res) for _ in range(2)])
+
+        self.fc=nn.Linear(d,tv)
+
+    def forward(self,s,t,sm,tm):
+        x=self.pos(self.se(s))
+        for l in self.enc:
+            x=l(x,sm)
+
+        y=self.pos(self.te(t))
+        for l in self.dec:
+            y=l(y,x,sm,tm)
+
+        return self.fc(y)
+
+
+# ================= Mask =================
+def src_mask(x,p): return (x!=p).unsqueeze(1).unsqueeze(2)
+
+def tgt_mask(x,p):
+    B,L=x.shape
+    pad=(x!=p).unsqueeze(1).unsqueeze(2)
+    causal=torch.triu(torch.ones(L,L),1).bool().to(x.device)
+    causal=causal.unsqueeze(0).unsqueeze(0)
+    return pad & (~causal)
+
+
+# ================= 训练 =================
+def train(model,data,opt,crit,p):
+    model.train(); tot=0
+    for s,t in data:
+        s,t=s.to(device),t.to(device)
+        ti=t[:,:-1]; to=t[:,1:]
+
+        sm=src_mask(s,p)
+        tm=tgt_mask(ti,p)
+
+        o=model(s,ti,sm,tm)
+        loss=crit(o.reshape(-1,o.size(-1)),to.reshape(-1))
+
+        opt.zero_grad(); loss.backward(); opt.step()
+        tot+=loss.item()
+    return tot/len(data)
+
+
+def evaluate(model,data,crit,p):
+    model.eval(); tot=0
+    with torch.no_grad():
+        for s,t in data:
+            s,t=s.to(device),t.to(device)
+            ti=t[:,:-1]; to=t[:,1:]
+            sm=src_mask(s,p)
+            tm=tgt_mask(ti,p)
+            o=model(s,ti,sm,tm)
+            loss=crit(o.reshape(-1,o.size(-1)),to.reshape(-1))
+            tot+=loss.item()
+    return tot/len(data)
+
+
+# ================= BLEU =================
+def bleu(model,data,sv,tv,p):
+    model.eval()
+    hyps,refs=[],[]
+
+    itos={i:w for w,i in tv.items()}
+
+    for s,t in data:
+        s=s.to(device)
+        for i in range(s.size(0)):
+            src=s[i].unsqueeze(0)
+            sm=src_mask(src,p)
+
+            out=[1]
+            for _ in range(50):
+                trg=torch.tensor(out).unsqueeze(0).to(device)
+                tm=tgt_mask(trg,p)
+                o=model(src,trg,sm,tm)
+                nxt=o[0,-1].argmax().item()
+                out.append(nxt)
+                if nxt==2: break
+
+            hyp=" ".join([itos.get(x,"") for x in out[1:-1]])
+            ref=" ".join([itos.get(x,"") for x in t[i].tolist()[1:-1]])
+
+            hyps.append(hyp)
+            refs.append([ref])
+
+            if len(hyps)>200: break
+        break
+
+    return corpus_bleu(hyps,refs).score
+
+
+# ================= 主 =================
+def run(mode):
+    train_loader,val_loader,test_loader,sv,tv,p=load()
+
+    if mode=="baseline":
+        model=Transformer(len(sv),len(tv),True,False)
+    elif mode=="no_residual":
+        model=Transformer(len(sv),len(tv),False,False)
+    elif mode=="kv_shared":
+        model=Transformer(len(sv),len(tv),True,True)
+
+    model.to(device)
+
+    opt=optim.Adam(model.parameters(),1e-4)
+    crit=nn.CrossEntropyLoss(ignore_index=p)
+
+    for e in range(10):
+        tl=train(model,train_loader,opt,crit,p)
+        vl=evaluate(model,val_loader,crit,p)
+        print(f"Epoch {e+1} | Train {tl:.3f} | Val {vl:.3f}")
+
+    print("BLEU:",bleu(model,test_loader,sv,tv,p))
+
+
+if __name__=="__main__":
+    run("kv_shared")
